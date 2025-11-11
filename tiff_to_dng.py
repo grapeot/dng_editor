@@ -136,8 +136,120 @@ def modify_dng_pixels(dng_path, new_pixel_data):
                     subifd_offset = struct.unpack(endian + 'I', value_offset)[0]
                     break
         
-        # 使用 SubIFD 如果存在，否则使用主 IFD
-        target_ifd_offset = subifd_offset if subifd_offset else first_ifd_offset
+        # 智能选择目标 IFD：优先 SubIFD，如果无效则检查主 IFD 是否是 RAW 数据
+        target_ifd_offset = None
+        target_ifd_type = None
+        
+        # 1. 检查 SubIFD 是否有效
+        if subifd_offset:
+            f.seek(subifd_offset)
+            try:
+                subifd_num_entries = struct.unpack(endian + 'H', f.read(2))[0]
+                if subifd_num_entries > 0 and subifd_num_entries < 1000:
+                    # 检查是否有 StripOffsets 和 StripByteCounts
+                    has_strip_offsets = False
+                    has_strip_byte_counts = False
+                    for j in range(min(subifd_num_entries, 100)):
+                        stag = struct.unpack(endian + 'H', f.read(2))[0]
+                        sdt = struct.unpack(endian + 'H', f.read(2))[0]
+                        scount = struct.unpack(endian + 'I', f.read(4))[0]
+                        sval = f.read(4)
+                        if stag == 273:  # StripOffsets
+                            has_strip_offsets = True
+                        elif stag == 279:  # StripByteCounts
+                            has_strip_byte_counts = True
+                    
+                    if has_strip_offsets and has_strip_byte_counts:
+                        target_ifd_offset = subifd_offset
+                        target_ifd_type = "SubIFD"
+                        print(f"  使用 SubIFD (偏移: {subifd_offset}, 条目数: {subifd_num_entries})")
+            except:
+                pass
+        
+        # 2. 如果 SubIFD 无效，检查主 IFD 是否是 RAW 数据
+        if target_ifd_offset is None:
+            f.seek(first_ifd_offset)
+            num_entries = struct.unpack(endian + 'H', f.read(2))[0]
+            
+            main_strip_bytes = None
+            main_bits = None
+            main_samples = None
+            main_compression = None
+            
+            for i in range(num_entries):
+                tag = struct.unpack(endian + 'H', f.read(2))[0]
+                dt = struct.unpack(endian + 'H', f.read(2))[0]
+                count = struct.unpack(endian + 'I', f.read(4))[0]
+                val = f.read(4)
+                
+                if tag == 279:  # StripByteCounts
+                    if count == 1:
+                        main_strip_bytes = struct.unpack(endian + 'I', val)[0]
+                elif tag == 258:  # BitsPerSample
+                    if count == 1:
+                        main_bits = struct.unpack(endian + ('H' if dt == 3 else 'I'), val[:2 if dt == 3 else 4])[0]
+                    else:
+                        offset_to_data = struct.unpack(endian + 'I', val)[0]
+                        current_pos = f.tell()
+                        f.seek(offset_to_data)
+                        if dt == 3:
+                            bits_array = list(struct.unpack(endian + 'H' * count, f.read(2 * count)))
+                            main_bits = bits_array[0] if bits_array else None
+                        f.seek(current_pos)
+                elif tag == 277:  # SamplesPerPixel
+                    main_samples = struct.unpack(endian + ('H' if dt == 3 else 'I'), val[:2 if dt == 3 else 4])[0]
+                elif tag == 259:  # Compression
+                    main_compression = struct.unpack(endian + ('H' if dt == 3 else 'I'), val[:2 if dt == 3 else 4])[0]
+            
+            # 判断主 IFD 是否是 RAW 数据
+            # RAW 数据特征：单通道（SamplesPerPixel=1），BitsPerSample 在合理范围（12-16）
+            # 数据大小接近预期的 RAW 数据大小
+            is_raw_data = False
+            if main_samples == 1 and main_bits and 12 <= main_bits <= 16:
+                # 计算预期的 RAW 数据大小
+                expected_bytes_16 = new_pixel_data.size * 2
+                expected_bytes_14 = new_pixel_data.size * 14 // 8
+                if main_bits == 16:
+                    expected_bytes = expected_bytes_16
+                else:
+                    expected_bytes = expected_bytes_14
+                
+                # 允许一定的误差（压缩、对齐等）
+                if main_strip_bytes and main_strip_bytes >= expected_bytes * 0.8:
+                    is_raw_data = True
+            
+            if is_raw_data:
+                target_ifd_offset = first_ifd_offset
+                target_ifd_type = "主 IFD (RAW)"
+                print(f"  使用主 IFD (RAW 数据, BitsPerSample={main_bits}, SamplesPerPixel={main_samples})")
+            else:
+                # 主 IFD 不是 RAW 数据，可能是预览图
+                # 尝试查找下一个 IFD
+                f.seek(first_ifd_offset)
+                num_entries = struct.unpack(endian + 'H', f.read(2))[0]
+                # 跳过所有条目，找到 next IFD 指针
+                f.seek(first_ifd_offset + 2 + num_entries * 12)
+                next_ifd = struct.unpack(endian + 'I', f.read(4))[0]
+                
+                if next_ifd != 0:
+                    print(f"  尝试查找下一个 IFD (偏移: {next_ifd})")
+                    # 这里可以继续查找，但为了简化，先使用主 IFD
+                    target_ifd_offset = first_ifd_offset
+                    target_ifd_type = "主 IFD"
+                    print(f"  使用主 IFD (偏移: {first_ifd_offset})")
+                    if main_samples == 3:
+                        print(f"    警告: 主 IFD 是预览图 (SamplesPerPixel=3)，转换可能不会影响 rawpy 读取的数据")
+                        print(f"    提示: 此文件可能需要特殊处理，RAW 数据可能以压缩格式存储")
+                else:
+                    target_ifd_offset = first_ifd_offset
+                    target_ifd_type = "主 IFD"
+                    print(f"  使用主 IFD (偏移: {first_ifd_offset})")
+                    if main_samples == 3:
+                        print(f"    警告: 主 IFD 是预览图 (SamplesPerPixel=3)，转换可能不会影响 rawpy 读取的数据")
+                        print(f"    提示: 此文件可能需要特殊处理，RAW 数据可能以压缩格式存储")
+        
+        if target_ifd_offset is None:
+            raise ValueError("无法找到有效的 RAW 数据 IFD")
         
         f.seek(target_ifd_offset)
         num_entries = struct.unpack(endian + 'H', f.read(2))[0]
