@@ -59,6 +59,46 @@ def tiff_to_dng(tiff_path, original_dng_path, output_dng_path=None):
     
     print(f"\n✓ 转换完成: {output_dng_path}")
 
+def pack_14bit_data(data, endian='<'):
+    """
+    将 14 位像素数据打包成 DNG 格式
+    格式：每 7 字节存储 4 个 14 位像素
+    
+    解包格式（反向推导）：
+    p0 = (b0 << 6) | ((b1 >> 2) & 0x3F)
+    p1 = ((b1 & 0x03) << 12) | (b2 << 4) | ((b3 >> 4) & 0x0F)
+    p2 = ((b3 & 0x0F) << 10) | (b4 << 2) | ((b5 >> 6) & 0x03)
+    p3 = ((b5 & 0x3F) << 8) | b6
+    """
+    data_flat = data.flatten()
+    num_pixels = len(data_flat)
+    num_groups = (num_pixels + 3) // 4  # 每组 4 个像素
+    packed = bytearray()
+    
+    for i in range(num_groups):
+        start_idx = i * 4
+        end_idx = min(start_idx + 4, num_pixels)
+        pixels = data_flat[start_idx:end_idx]
+        
+        # 如果不足 4 个像素，用 0 填充
+        if len(pixels) < 4:
+            pixels = np.append(pixels, [0] * (4 - len(pixels)))
+        
+        p0, p1, p2, p3 = pixels.astype(np.uint16)
+        
+        # 根据解包格式反向推导打包格式
+        byte0 = (p0 >> 6) & 0xFF
+        byte1 = ((p0 & 0x3F) << 2) | ((p1 >> 12) & 0x03)
+        byte2 = (p1 >> 4) & 0xFF
+        byte3 = ((p1 & 0x0F) << 4) | ((p2 >> 10) & 0x0F)
+        byte4 = (p2 >> 2) & 0xFF
+        byte5 = ((p2 & 0x03) << 6) | ((p3 >> 8) & 0x3F)
+        byte6 = p3 & 0xFF
+        
+        packed.extend([byte0, byte1, byte2, byte3, byte4, byte5, byte6])
+    
+    return bytes(packed)
+
 def modify_dng_pixels(dng_path, new_pixel_data):
     """
     在 DNG 文件中替换像素数据
@@ -102,10 +142,12 @@ def modify_dng_pixels(dng_path, new_pixel_data):
         f.seek(target_ifd_offset)
         num_entries = struct.unpack(endian + 'H', f.read(2))[0]
         
-        # 查找 StripOffsets 和 StripByteCounts
+        # 查找 StripOffsets、StripByteCounts、BitsPerSample 和 Compression
         strip_offsets_tag = None
         strip_byte_counts_tag = None
+        bits_per_sample_tag = None
         compression = 1
+        bits_per_sample = 16  # 默认值
         
         for i in range(num_entries):
             tag = struct.unpack(endian + 'H', f.read(2))[0]
@@ -117,6 +159,24 @@ def modify_dng_pixels(dng_path, new_pixel_data):
                 strip_offsets_tag = (data_type, count, value_offset)
             elif tag == 279:  # StripByteCounts
                 strip_byte_counts_tag = (data_type, count, value_offset)
+            elif tag == 258:  # BitsPerSample
+                bits_per_sample_tag = (data_type, count, value_offset)
+                # 读取 BitsPerSample 值
+                if count == 1:
+                    if data_type == 3:  # SHORT
+                        bits_per_sample = struct.unpack(endian + 'H', value_offset[:2])[0]
+                    else:
+                        bits_per_sample = struct.unpack(endian + 'I', value_offset)[0]
+                else:
+                    # 多个值，读取第一个
+                    offset_to_data = struct.unpack(endian + 'I', value_offset)[0]
+                    current_pos = f.tell()
+                    f.seek(offset_to_data)
+                    if data_type == 3:
+                        bits_per_sample = struct.unpack(endian + 'H', f.read(2))[0]
+                    else:
+                        bits_per_sample = struct.unpack(endian + 'I', f.read(4))[0]
+                    f.seek(current_pos)
             elif tag == 259:  # Compression
                 if data_type == 3:
                     compression = struct.unpack(endian + 'H', value_offset[:2])[0]
@@ -197,11 +257,26 @@ def modify_dng_pixels(dng_path, new_pixel_data):
                 strip_byte_counts_tag_pos = value_pos
                 strip_byte_counts_tag_data_type = data_type
         
-        # 准备新的像素数据（未压缩）
-        if new_pixel_data.dtype == np.uint16:
-            pixel_bytes = new_pixel_data.tobytes()
+        # 准备新的像素数据，根据原始 BitsPerSample 转换格式
+        if bits_per_sample == 16:
+            # 16 位：直接使用
+            if new_pixel_data.dtype == np.uint16:
+                pixel_bytes = new_pixel_data.tobytes()
+            else:
+                pixel_bytes = new_pixel_data.astype(np.uint16).tobytes()
+        elif bits_per_sample == 14:
+            # 14 位：需要打包成特殊格式
+            # 14 位数据格式：每 7 字节存储 4 个像素
+            # 像素值需要限制在 14 位范围内 (0-16383)
+            data_14bit = np.clip(new_pixel_data, 0, 16383).astype(np.uint16)
+            pixel_bytes = pack_14bit_data(data_14bit, endian)
         else:
-            pixel_bytes = new_pixel_data.astype(np.uint16).tobytes()
+            # 其他位数：暂时不支持，使用 16 位
+            print(f"警告: BitsPerSample={bits_per_sample}，暂不支持，使用 16 位格式")
+            if new_pixel_data.dtype == np.uint16:
+                pixel_bytes = new_pixel_data.tobytes()
+            else:
+                pixel_bytes = new_pixel_data.astype(np.uint16).tobytes()
         
         # 总是将未压缩数据写入文件末尾，避免覆盖现有数据
         f.seek(0, 2)  # 移动到文件末尾
