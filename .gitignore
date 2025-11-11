@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# DNG 和图像文件（不提交大文件）
+*.DNG
+*.dng
+*.tiff
+*.tif
+*.backup
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
