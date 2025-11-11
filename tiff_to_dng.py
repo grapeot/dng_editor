@@ -62,6 +62,7 @@ def tiff_to_dng(tiff_path, original_dng_path, output_dng_path=None):
 def modify_dng_pixels(dng_path, new_pixel_data):
     """
     在 DNG 文件中替换像素数据
+    优先查找 SubIFD（标签 330），因为 rawpy 通常读取 SubIFD 中的数据
     """
     with open(dng_path, 'r+b') as f:
         # 读取 TIFF 头
@@ -77,8 +78,28 @@ def modify_dng_pixels(dng_path, new_pixel_data):
         if tiff_id != 42:
             raise ValueError("不是有效的 TIFF/DNG 文件")
         
-        ifd_offset = struct.unpack(endian + 'I', f.read(4))[0]
-        f.seek(ifd_offset)
+        first_ifd_offset = struct.unpack(endian + 'I', f.read(4))[0]
+        
+        # 查找 SubIFD（标签 330）
+        f.seek(first_ifd_offset)
+        num_entries = struct.unpack(endian + 'H', f.read(2))[0]
+        
+        subifd_offset = None
+        for i in range(num_entries):
+            tag = struct.unpack(endian + 'H', f.read(2))[0]
+            data_type = struct.unpack(endian + 'H', f.read(2))[0]
+            count = struct.unpack(endian + 'I', f.read(4))[0]
+            value_offset = f.read(4)
+            
+            if tag == 330:  # SubIFDs
+                if count > 0:
+                    subifd_offset = struct.unpack(endian + 'I', value_offset)[0]
+                    break
+        
+        # 使用 SubIFD 如果存在，否则使用主 IFD
+        target_ifd_offset = subifd_offset if subifd_offset else first_ifd_offset
+        
+        f.seek(target_ifd_offset)
         num_entries = struct.unpack(endian + 'H', f.read(2))[0]
         
         # 查找 StripOffsets 和 StripByteCounts
@@ -141,7 +162,7 @@ def modify_dng_pixels(dng_path, new_pixel_data):
                 strip_byte_counts = list(struct.unpack(endian + 'I' * count, f.read(4 * count)))
             f.seek(current_pos)
         
-        # 准备新的像素数据
+        # 准备新的像素数据（未压缩）
         if new_pixel_data.dtype == np.uint16:
             pixel_bytes = new_pixel_data.tobytes()
         else:
@@ -149,57 +170,71 @@ def modify_dng_pixels(dng_path, new_pixel_data):
         
         expected_bytes = new_pixel_data.size * 2  # 16位 = 2字节
         
-        # 如果数据是压缩的，我们需要扩展文件
-        is_compressed = compression != 1 and strip_byte_counts[0] < expected_bytes
+        # 记录标签位置以便后续更新
+        compression_tag_pos = None
+        strip_offsets_tag_pos = None
+        strip_byte_counts_tag_pos = None
+        compression_tag_data_type = None
+        strip_offsets_tag_data_type = None
+        strip_byte_counts_tag_data_type = None
         
-        if is_compressed:
-            # 读取整个文件
-            f.seek(0)
-            file_data = bytearray(f.read())
+        # 重新读取 IFD 以记录标签位置
+        f.seek(target_ifd_offset + 2)
+        for i in range(num_entries):
+            tag = struct.unpack(endian + 'H', f.read(2))[0]
+            data_type = struct.unpack(endian + 'H', f.read(2))[0]
+            count = struct.unpack(endian + 'I', f.read(4))[0]
+            value_pos = f.tell()
+            value_offset = f.read(4)
             
-            bytes_to_insert = len(pixel_bytes) - strip_byte_counts[0]
-            strip_start = strip_offsets[0]
-            strip_end = strip_start + strip_byte_counts[0]
-            
-            # 替换像素数据
-            file_data[strip_start:strip_end] = pixel_bytes
-            
-            # 更新后续偏移量
-            for i, offset in enumerate(strip_offsets):
-                if offset > strip_start:
-                    strip_offsets[i] += bytes_to_insert
-            
-            f.seek(0)
-            f.write(file_data)
-            f.truncate()
+            if tag == 259:  # Compression
+                compression_tag_pos = value_pos
+                compression_tag_data_type = data_type
+            elif tag == 273:  # StripOffsets
+                strip_offsets_tag_pos = value_pos
+                strip_offsets_tag_data_type = data_type
+            elif tag == 279:  # StripByteCounts
+                strip_byte_counts_tag_pos = value_pos
+                strip_byte_counts_tag_data_type = data_type
+        
+        # 准备新的像素数据（未压缩）
+        if new_pixel_data.dtype == np.uint16:
+            pixel_bytes = new_pixel_data.tobytes()
         else:
-            # 直接写入
-            f.seek(strip_offsets[0])
-            f.write(pixel_bytes)
+            pixel_bytes = new_pixel_data.astype(np.uint16).tobytes()
         
-        # 更新 StripByteCounts 和 Compression
-        if strip_byte_counts[0] != len(pixel_bytes) or compression != 1:
-            f.seek(ifd_offset + 2)
-            for i in range(num_entries):
-                tag = struct.unpack(endian + 'H', f.read(2))[0]
-                data_type = struct.unpack(endian + 'H', f.read(2))[0]
-                count = struct.unpack(endian + 'I', f.read(4))[0]
-                value_pos = f.tell()
-                value_offset = f.read(4)
-                
-                if tag == 279:  # StripByteCounts
-                    if count == 1:
-                        f.seek(value_pos)
-                        if data_type == 3:
-                            f.write(struct.pack(endian + 'H', len(pixel_bytes)))
-                        else:
-                            f.write(struct.pack(endian + 'I', len(pixel_bytes)))
-                elif tag == 259 and compression != 1:  # Compression
-                    f.seek(value_pos)
-                    if data_type == 3:
-                        f.write(struct.pack(endian + 'H', 1))
-                    else:
-                        f.write(struct.pack(endian + 'I', 1))
+        # 总是将未压缩数据写入文件末尾，避免覆盖现有数据
+        f.seek(0, 2)  # 移动到文件末尾
+        new_strip_offset = f.tell()
+        f.write(pixel_bytes)
+        
+        # 更新 StripOffsets
+        if strip_offsets_tag_pos:
+            f.seek(strip_offsets_tag_pos)
+            if strip_offsets_tag_data_type == 3:  # SHORT
+                f.write(struct.pack(endian + 'H', new_strip_offset & 0xFFFF))
+                # 如果偏移量超过 16 位，需要更新为 LONG 类型
+                if new_strip_offset > 0xFFFF:
+                    # 这需要更复杂的处理，暂时跳过
+                    pass
+            else:  # LONG
+                f.write(struct.pack(endian + 'I', new_strip_offset))
+        
+        # 更新 StripByteCounts
+        if strip_byte_counts_tag_pos:
+            f.seek(strip_byte_counts_tag_pos)
+            if strip_byte_counts_tag_data_type == 3:  # SHORT
+                f.write(struct.pack(endian + 'H', len(pixel_bytes) & 0xFFFF))
+            else:  # LONG
+                f.write(struct.pack(endian + 'I', len(pixel_bytes)))
+        
+        # 更新 Compression 为 1 (未压缩)
+        if compression_tag_pos and compression != 1:
+            f.seek(compression_tag_pos)
+            if compression_tag_data_type == 3:  # SHORT
+                f.write(struct.pack(endian + 'H', 1))
+            else:  # LONG
+                f.write(struct.pack(endian + 'I', 1))
 
 def main():
     """主函数"""
